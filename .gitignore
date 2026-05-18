@@ -17,3 +17,7 @@ tmp/
 test.http
 .secrets
 wrangler.jsonc
+docs/superpowers/
+.cache/
+*.tsbuildinfo
+.fallow

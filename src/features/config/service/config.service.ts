@@ -8,8 +8,31 @@ import {
 } from "@/features/config/config.schema";
 import * as ConfigRepo from "@/features/config/data/config.data";
 import { FullSiteConfigSchema } from "@/features/config/site-config.schema";
+import type { SocialLink } from "@/features/config/utils/social-platforms";
 import * as Storage from "@/features/media/data/media.storage";
 import { purgeSiteCDNCache } from "@/lib/invalidate";
+
+const DEFAULT_SMTP_PORT = 465;
+const RESEND_SMTP_HOST = "smtp.resend.com";
+const RESEND_SMTP_USERNAME = "resend";
+
+function resolveEmailConfig(config: SystemConfig | null | undefined) {
+  const email = config?.email;
+  const legacyApiKey = email?.apiKey?.trim() || "";
+  const password = email?.password?.trim() || legacyApiKey;
+  const host = email?.host?.trim() || (legacyApiKey ? RESEND_SMTP_HOST : "");
+  const username =
+    email?.username?.trim() || (legacyApiKey ? RESEND_SMTP_USERNAME : "");
+
+  return {
+    host,
+    port: email?.port ?? DEFAULT_SMTP_PORT,
+    username,
+    password,
+    senderName: email?.senderName ?? "",
+    senderAddress: email?.senderAddress ?? "",
+  };
+}
 
 export function resolveSystemConfig(
   config: SystemConfig | null | undefined,
@@ -17,10 +40,7 @@ export function resolveSystemConfig(
   return {
     ...DEFAULT_CONFIG,
     ...config,
-    email: {
-      ...DEFAULT_CONFIG.email,
-      ...config?.email,
-    },
+    email: resolveEmailConfig(config),
     notification: {
       ...DEFAULT_CONFIG.notification,
       ...config?.notification,
@@ -43,6 +63,24 @@ export function resolveSystemConfig(
   };
 }
 
+function migrateSocial(social: unknown): SocialLink[] {
+  // New format — already an array
+  if (Array.isArray(social)) return social;
+
+  // Old format — { github?: string, email?: string }
+  if (social && typeof social === "object") {
+    const old = social as { github?: string; email?: string };
+    const migrated: SocialLink[] = [];
+    if (old.github) migrated.push({ platform: "github", url: old.github });
+    if (old.email)
+      migrated.push({ platform: "email", url: `mailto:${old.email}` });
+    return migrated;
+  }
+
+  // Fallback to blogConfig defaults
+  return [...blogConfig.social];
+}
+
 export function resolveSiteConfig(
   config: SystemConfig | null | undefined,
 ): SiteConfig {
@@ -52,10 +90,7 @@ export function resolveSiteConfig(
     title: config?.site?.title ?? blogConfig.title,
     author: config?.site?.author ?? blogConfig.author,
     description: config?.site?.description ?? blogConfig.description,
-    social: {
-      github: config?.site?.social?.github ?? blogConfig.social.github,
-      email: config?.site?.social?.email ?? blogConfig.social.email,
-    },
+    social: migrateSocial(config?.site?.social),
     icons: {
       faviconSvg:
         config?.site?.icons?.faviconSvg || blogConfig.icons.faviconSvg,
@@ -114,13 +149,28 @@ function hasSiteConfigChanged(
 export async function getSystemConfig(
   context: DbContext & { executionCtx: ExecutionContext },
 ) {
-  return await CacheService.get(
+  const config = await CacheService.get(
     context,
     CONFIG_CACHE_KEYS.system,
     SystemConfigSchema,
     async () =>
       resolveSystemConfig(await ConfigRepo.getSystemConfig(context.db)),
   );
+
+  const normalizedConfig = resolveSystemConfig(config);
+
+  if (JSON.stringify(config) !== JSON.stringify(normalizedConfig)) {
+    context.executionCtx.waitUntil(
+      CacheService.set(
+        context,
+        CONFIG_CACHE_KEYS.system,
+        JSON.stringify(normalizedConfig),
+        { ttl: "1h" },
+      ),
+    );
+  }
+
+  return normalizedConfig;
 }
 
 export async function getSiteConfig(

@@ -14,7 +14,7 @@ Deeply integrated with D1, R2, KV, Workflows, and other Serverless services.
 [![TanStack Start](https://img.shields.io/badge/TanStack%20Start-black?logo=tanstack&style=flat-square)](https://tanstack.com/start)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-4.0-38B2AC?logo=tailwind-css&style=flat-square)](https://tailwindcss.com)
 
-[Deployment Guide](#deployment-guide) · [Local Development](#local-development) · [Development Guidelines](./error-handling-quickstart.en.md)
+[Demo Site](https://blog.dukda.com) · [Deployment Guide](#deployment-guide) · [Local Development](#local-development) · [Development Guidelines](./error-handling-quickstart.en.md)
 
 </div>
 
@@ -208,11 +208,9 @@ Please refer to the **[Flare Stack Blog Deployment Guide](./deployment-guide.en.
 | `GITHUB_TOKEN`            | Runtime    | GitHub API Token (for version updates checking to avoid rate limits).                                    |
 | `LOCALE`                  | Runtime    | Default language: `zh` or `en`. Default: `zh`. Used for emails, webhooks, and background task messaging. |
 | `CDN_DOMAIN`              | Runtime    | Standalone CDN domain (e.g., `cdn.example.com`), preferentially used during purge.                       |
-| `UMAMI_SRC`               | Runtime    | Umami base URL (Cloud: `https://cloud.umami.is`).                                                        |
-| `UMAMI_API_KEY`           | Runtime    | Umami Cloud API key (for Cloud version exclusively).                                                     |
-| `UMAMI_USERNAME`          | Runtime    | Umami username (Self-hosted exclusively).                                                                |
-| `UMAMI_PASSWORD`          | Runtime    | Umami password (Self-hosted exclusively).                                                                |
-| `VITE_UMAMI_WEBSITE_ID`   | Build-time | Umami Website ID.                                                                                        |
+| `PAGEVIEW_SALT`           | Runtime    | Salt for anonymizing pageview visitor hashes. Generate with `openssl rand -hex 16`.                      |
+| `UMAMI_SRC`               | Runtime    | Umami client-side tracking proxy URL (e.g., `https://cloud.umami.is`).                                   |
+| `VITE_UMAMI_WEBSITE_ID`   | Build-time | Umami Website ID (client-side tracking).                                                                 |
 
 ---
 
