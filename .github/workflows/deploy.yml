@@ -102,6 +102,12 @@ jobs:
       # --- 部署凭据 ---
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # --- 可选：Umami 访问统计 ---
+      # v2 里 VITE_UMAMI_WEBSITE_ID 是「构建期」变量（clientEnv() 读 import.meta.env，
+      # 在构建时被 Vite 内联进产物），所以必须在这里注入，不能只设 Worker 运行期机密。
+      # 值取自仓库 Settings → Secrets and variables → Actions → Variables。
+      # 未设置时为空字符串，前端不会输出统计脚本（安全）。
+      VITE_UMAMI_WEBSITE_ID: ${{ vars.VITE_UMAMI_WEBSITE_ID }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -154,3 +160,23 @@ jobs:
           done
           echo "线上版本未更新到 $EXPECTED"
           exit 1
+
+      - name: Verify Umami wiring
+        run: |
+          set -euo pipefail
+          if [ -z "${VITE_UMAMI_WEBSITE_ID:-}" ]; then
+            echo "未配置 VITE_UMAMI_WEBSITE_ID，跳过 Umami 检查。"
+            exit 0
+          fi
+          # 1) /stats.js 由 Worker 代理到 UMAMI_SRC/script.js；UMAMI_SRC 为空时这里会是 404
+          CODE=$(curl -s -o /tmp/stats.js -w '%{http_code}' "https://${DOMAIN}/stats.js" || true)
+          echo "/stats.js -> HTTP ${CODE}  $(wc -c < /tmp/stats.js) 字节"
+          if [ "$CODE" != "200" ]; then
+            echo "UMAMI_SRC 未配置或 Umami 服务不可达（期望 200，实得 ${CODE}）"
+            exit 1
+          fi
+          # 2) 首页应带上统计脚本标记，且 website id 与构建变量一致
+          HOME=$(curl -fsS "https://${DOMAIN}/" || true)
+          printf '%s' "$HOME" | grep -q 'data-website-id="'"${VITE_UMAMI_WEBSITE_ID}"'"' \
+            || { echo "首页未出现 data-website-id=\"${VITE_UMAMI_WEBSITE_ID}\""; exit 1; }
+          echo "Umami 接线正常：脚本已注入，website id 匹配。"
