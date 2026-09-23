@@ -1,0 +1,156 @@
+# 自动部署：fork 的 main 有新提交就构建并发布到 Cloudflare Workers。
+# 每天还会自动把上游 du2333/flare-stack-blog 的 main 合并进 fork，上游发版后无需手动同步。
+#
+# 与官方 docs/deployment.md 的 Cloudflare Workers Builds 等价：
+#   Build command  -> bun run wrangler:prepare && bun run build
+#   Deploy command -> bun run deploy
+# 差别只是用 GitHub Actions 承载，构建变量取自本仓库 Secrets。
+name: deploy to cloudflare workers
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".vscode/**"
+      - ".github/ISSUE_TEMPLATE/**"
+  schedule:
+    # 每天 02:17 UTC，即北京时间 10:17，检查上游是否有新提交
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: 先同步上游 main，再部署
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync-upstream:
+    name: Sync upstream main
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.sync_upstream == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main into fork main
+        id: sync
+        env:
+          UPSTREAM_REPO: du2333/flare-stack-blog
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+          FORK_SHA=$(git rev-parse HEAD)
+          UP_SHA=$(git rev-parse upstream/main)
+          echo "fork main = $FORK_SHA"
+          echo "upstream  = $UP_SHA"
+
+          if [ "$FORK_SHA" = "$UP_SHA" ] || git merge-base --is-ancestor "$UP_SHA" "$FORK_SHA"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游没有新提交，跳过同步与部署。"
+            exit 0
+          fi
+
+          git merge --no-edit upstream/main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "已把上游新提交合并进 fork main。"
+
+      - name: Push merged main
+        if: steps.sync.outputs.changed == 'true'
+        run: git push origin HEAD:main
+
+  deploy:
+    name: Deploy
+    needs: [sync-upstream]
+    if: >-
+      always() && !cancelled()
+      && needs.sync-upstream.result != 'failure'
+      && (github.event_name != 'schedule'
+          || needs.sync-upstream.outputs.changed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # --- 构建期必填：前两项必须与 Cloudflare 上的 Worker / Queue 名称一致 ---
+      WORKER_NAME: my-blog
+      QUEUE_NAME: blog-queue
+      DOMAIN: 813146.xyz
+      # --- 构建期必填：从本仓库 Secrets 读取（D1 / KV 填 ID，R2 填桶名） ---
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+      KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+      BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
+      # --- 部署凭据 ---
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun ci
+
+      - name: Generate wrangler.jsonc
+        run: bun run wrangler:prepare
+
+      - name: Build
+        run: bun run build
+
+      # bun run deploy = bun db:migrate && wrangler deploy
+      # 迁移是幂等的；Worker 已有的运行时变量与机密由 keep_vars 保留。
+      - name: Migrate D1 and deploy Worker
+        run: bun run deploy
+
+      - name: Verify live version
+        run: |
+          set -euo pipefail
+          EXPECTED=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+          for i in $(seq 1 10); do
+            BODY=$(curl -fsS "https://${DOMAIN}/api/spec.json" || true)
+            GOT=$(printf '%s' "$BODY" | python3 -c "import json,sys;print(json.load(sys.stdin).get('info',{}).get('version',''))" 2>/dev/null || true)
+            if [ "$GOT" = "$EXPECTED" ]; then
+              echo "线上版本已是 $GOT"
+              exit 0
+            fi
+            echo "第 $i 次：线上 ${GOT:-(取不到)}，期望 $EXPECTED，等待生效…"
+            sleep 15
+          done
+          echo "线上版本未更新到 $EXPECTED"
+          exit 1
