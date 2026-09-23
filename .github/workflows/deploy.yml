@@ -257,28 +257,34 @@ jobs:
           fi
 
           # 2) 首页应带上两个统计标记。缓存刚清过，但边缘传播仍可能滞后，所以带重试。
-          #    取回细节：首页 HTML 含 NUL 字节（TanStack Start 的 SSR hydration payload，
-          #    形如 "__root__\0"），bash 命令替换会丢弃并告警，先 tr -d '\0' 更干净；
-          #    变量名不要用 HOME，那是 shell / setup-* action 依赖的特殊变量。
-          #    Clarity 的 id 是作为参数出现在内联脚本末尾（"clarity", "script", "<id>"），
+          #
+          #    ⚠️ 这里刻意「不」用 printf '%s' "$HTML" | grep -q ...：
+          #    grep -q 命中后立即退出，还在写管道的 printf 会吃到 SIGPIPE 返回 141，
+          #    在 set -o pipefail 下整条管道被判为失败 —— 结果是「明明命中了却报缺失」。
+          #    改成先落盘再 grep 文件，彻底绕开管道与 SIGPIPE。
+          #    另外首页 HTML 本身含 NUL 字节（TanStack Start 的 SSR hydration payload，
+          #    形如 "__root__\0"），grep 对含 NUL 的文件照样能匹配，无需额外处理。
+          #    Clarity 的 id 作为参数出现在内联脚本末尾（"clarity", "script", "<id>"），
           #    所以不能按 clarity.ms/tag/<id> 去匹配，要分别匹配脚本入口和 id。
           ok=0
           for i in $(seq 1 15); do
-            PAGE_HTML=$(curl -fsS -H 'Cache-Control: no-cache' "https://${DOMAIN}/" | tr -d '\0' || true)
+            curl -fsS -H 'Cache-Control: no-cache' "https://${DOMAIN}/" -o /tmp/page.html || true
             miss=""
             if [ -n "$want_umami" ]; then
-              printf '%s' "$PAGE_HTML" | grep -qF "data-website-id=\"${want_umami}\"" || miss="${miss} umami"
+              grep -qF "data-website-id=\"${want_umami}\"" /tmp/page.html || miss="${miss} umami"
             fi
             if [ -n "$want_clarity" ]; then
-              { printf '%s' "$PAGE_HTML" | grep -qF "clarity.ms/tag/" \
-                && printf '%s' "$PAGE_HTML" | grep -qF "${want_clarity}"; } || miss="${miss} clarity"
+              if ! grep -qF "clarity.ms/tag/" /tmp/page.html \
+                || ! grep -qF "${want_clarity}" /tmp/page.html; then
+                miss="${miss} clarity"
+              fi
             fi
             if [ -z "$miss" ]; then
               echo "第 $i 次检查：首页已注入全部统计脚本。"
               ok=1
               break
             fi
-            echo "第 $i 次检查：首页还缺${miss}，等待新版本传播…"
+            echo "第 $i 次检查：首页还缺${miss}（$(wc -c < /tmp/page.html) 字节），等待新版本传播…"
             sleep 6
           done
           if [ "$ok" != "1" ]; then
