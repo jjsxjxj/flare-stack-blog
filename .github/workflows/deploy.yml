@@ -108,6 +108,14 @@ jobs:
       # 值取自仓库 Settings → Secrets and variables → Actions → Variables。
       # 未设置时为空字符串，前端不会输出统计脚本（安全）。
       VITE_UMAMI_WEBSITE_ID: ${{ vars.VITE_UMAMI_WEBSITE_ID }}
+      # --- 可选：Microsoft Clarity 访问统计 ---
+      # 同样是构建期变量（同处 src/routes/_public/route.tsx 的 head 里注入）。
+      VITE_CLARITY_PROJECT_ID: ${{ vars.VITE_CLARITY_PROJECT_ID }}
+      # --- 部署后清边缘缓存用的管理 API Key（可选）---
+      # 公开页面走 Workers Caching，边缘缓存 TTL 1 小时；不清的话部署后线上最长
+      # 1 小时仍是旧 HTML，而旧 HTML 引用的 /assets/* 哈希已随新部署被替换。
+      # 未配置时会跳过清缓存并告警，不影响部署本身。
+      BLOG_API_KEY: ${{ secrets.BLOG_API_KEY }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -139,11 +147,46 @@ jobs:
       - name: Build
         run: bun run build
 
+      # 构建期变量是被 Vite 内联进产物的，所以可以直接断言「到底有没有注入」。
+      # 这比抓线上首页可靠：不受边缘缓存影响，也不会被「上一个版本还活着」迷惑。
+      # 放在部署之前，配置写错就别白部署一次。
+      - name: Verify analytics ids in build output
+        run: |
+          set -euo pipefail
+          if [ ! -d dist ]; then
+            echo "::warning::未找到 dist/ 构建产物目录，跳过产物断言"
+            exit 0
+          fi
+          fail=0
+          if [ -n "${VITE_UMAMI_WEBSITE_ID:-}" ]; then
+            if grep -rqF "$VITE_UMAMI_WEBSITE_ID" dist; then
+              echo "构建产物已内联 Umami website id"
+            else
+              echo "::error::构建产物里没有 Umami website id，VITE_UMAMI_WEBSITE_ID 未参与构建"
+              fail=1
+            fi
+          else
+            echo "未配置 VITE_UMAMI_WEBSITE_ID，跳过。"
+          fi
+          if [ -n "${VITE_CLARITY_PROJECT_ID:-}" ]; then
+            if grep -rqF "$VITE_CLARITY_PROJECT_ID" dist; then
+              echo "构建产物已内联 Clarity project id"
+            else
+              echo "::error::构建产物里没有 Clarity project id，VITE_CLARITY_PROJECT_ID 未参与构建"
+              fail=1
+            fi
+          else
+            echo "未配置 VITE_CLARITY_PROJECT_ID，跳过。"
+          fi
+          exit $fail
+
       # bun run deploy = bun db:migrate && wrangler deploy
       # 迁移是幂等的；Worker 已有的运行时变量与机密由 keep_vars 保留。
       - name: Migrate D1 and deploy Worker
         run: bun run deploy
 
+      # 注意：这里比对的 package.json 版本号，所以「本次构建没有升版本」时它必然通过，
+      # 并不能证明新版本已经生效 —— 真正等待新版本生效的是下面清缓存 + 首页校验那两步。
       - name: Verify live version
         run: |
           set -euo pipefail
@@ -161,22 +204,96 @@ jobs:
           echo "线上版本未更新到 $EXPECTED"
           exit 1
 
-      - name: Verify Umami wiring
+      # 公开页面走 Workers Caching（见 src/server.ts 的 cf.cacheKey + wrangler 的 cache.enabled），
+      # 响应头是 CDN-Cache-Control: public, max-age=3600, stale-while-revalidate=86400。
+      # 也就是说部署完成后，边缘缓存里仍是「上一个版本」渲染出来的 HTML，最长 1 小时。
+      # 那段旧 HTML 引用的是已随新部署被替换掉的 /assets/*.js|css 哈希，会让访客拿到
+      # 没样式的页面；同时也会让下一步的线上校验读到旧内容而误报失败。
+      # 这里用应用自带的清缓存接口（invalidate.all：全量失效 KV + 边缘缓存）把它刷掉。
+      # 注意 workersCacheKey 会丢弃未知查询参数，所以 ?cb=xxx 这种破缓存手法是无效的。
+      - name: Purge CDN cache so the new build goes live
         run: |
           set -euo pipefail
-          if [ -z "${VITE_UMAMI_WEBSITE_ID:-}" ]; then
-            echo "未配置 VITE_UMAMI_WEBSITE_ID，跳过 Umami 检查。"
+          if [ -z "${BLOG_API_KEY:-}" ]; then
+            echo "::warning::未配置 BLOG_API_KEY，跳过清缓存；线上会在缓存过期前继续返回旧 HTML"
             exit 0
           fi
-          # 1) /stats.js 由 Worker 代理到 UMAMI_SRC/script.js；UMAMI_SRC 为空时这里会是 404
-          CODE=$(curl -s -o /tmp/stats.js -w '%{http_code}' "https://${DOMAIN}/stats.js" || true)
-          echo "/stats.js -> HTTP ${CODE}  $(wc -c < /tmp/stats.js) 字节"
+          CODE=""
+          for i in 1 2 3; do
+            CODE=$(curl -s -o /tmp/purge.json -w '%{http_code}' -X POST \
+              -H "x-api-key: ${BLOG_API_KEY}" \
+              -H 'Content-Type: application/json' \
+              -H 'User-Agent: Mozilla/5.0' \
+              --data '{}' "https://${DOMAIN}/api/admin/cache/invalidate" || true)
+            echo "清缓存第 $i 次 -> HTTP ${CODE}  $(cat /tmp/purge.json 2>/dev/null)"
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
           if [ "$CODE" != "200" ]; then
-            echo "UMAMI_SRC 未配置或 Umami 服务不可达（期望 200，实得 ${CODE}）"
+            echo "::warning::清缓存未成功（HTTP ${CODE}），线上可能短时间仍返回旧 HTML"
+            exit 0
+          fi
+          sleep 5   # 给边缘一点传播时间
+
+      - name: Verify analytics wiring live
+        run: |
+          set -euo pipefail
+          want_umami="${VITE_UMAMI_WEBSITE_ID:-}"
+          want_clarity="${VITE_CLARITY_PROJECT_ID:-}"
+          if [ -z "$want_umami" ] && [ -z "$want_clarity" ]; then
+            echo "未配置任何统计 id，跳过线上校验。"
+            exit 0
+          fi
+
+          # 1) /stats.js 由 Worker 代理到 ${UMAMI_SRC}/script.js；UMAMI_SRC 为空时是 404。
+          #    这条不带缓存，判据干净。
+          if [ -n "$want_umami" ]; then
+            CODE=$(curl -s -o /tmp/stats.js -w '%{http_code}' "https://${DOMAIN}/stats.js" || true)
+            echo "/stats.js -> HTTP ${CODE}  $(wc -c < /tmp/stats.js) 字节"
+            if [ "$CODE" != "200" ]; then
+              echo "UMAMI_SRC 未配置或 Umami 服务不可达（期望 200，实得 ${CODE}）"
+              exit 1
+            fi
+          fi
+
+          # 2) 首页应带上两个统计标记。缓存刚清过，但边缘传播仍可能滞后，所以带重试。
+          #    取回细节：首页 HTML 含 NUL 字节（TanStack Start 的 SSR hydration payload，
+          #    形如 "__root__\0"），bash 命令替换会丢弃并告警，先 tr -d '\0' 更干净；
+          #    变量名不要用 HOME，那是 shell / setup-* action 依赖的特殊变量。
+          #    Clarity 的 id 是作为参数出现在内联脚本末尾（"clarity", "script", "<id>"），
+          #    所以不能按 clarity.ms/tag/<id> 去匹配，要分别匹配脚本入口和 id。
+          ok=0
+          for i in $(seq 1 15); do
+            PAGE_HTML=$(curl -fsS -H 'Cache-Control: no-cache' "https://${DOMAIN}/" | tr -d '\0' || true)
+            miss=""
+            if [ -n "$want_umami" ]; then
+              printf '%s' "$PAGE_HTML" | grep -qF "data-website-id=\"${want_umami}\"" || miss="${miss} umami"
+            fi
+            if [ -n "$want_clarity" ]; then
+              { printf '%s' "$PAGE_HTML" | grep -qF "clarity.ms/tag/" \
+                && printf '%s' "$PAGE_HTML" | grep -qF "${want_clarity}"; } || miss="${miss} clarity"
+            fi
+            if [ -z "$miss" ]; then
+              echo "第 $i 次检查：首页已注入全部统计脚本。"
+              ok=1
+              break
+            fi
+            echo "第 $i 次检查：首页还缺${miss}，等待新版本传播…"
+            sleep 6
+          done
+          if [ "$ok" != "1" ]; then
+            echo "首页未出现期望的统计标记（umami=${want_umami:-未配置} clarity=${want_clarity:-未配置}）"
             exit 1
           fi
-          # 2) 首页应带上统计脚本标记，且 website id 与构建变量一致
-          HOME=$(curl -fsS "https://${DOMAIN}/" || true)
-          printf '%s' "$HOME" | grep -q 'data-website-id="'"${VITE_UMAMI_WEBSITE_ID}"'"' \
-            || { echo "首页未出现 data-website-id=\"${VITE_UMAMI_WEBSITE_ID}\""; exit 1; }
-          echo "Umami 接线正常：脚本已注入，website id 匹配。"
+
+          # 3) Clarity 脚本入口可达性（软检查，只告警不失败）
+          if [ -n "$want_clarity" ]; then
+            CCODE=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: Mozilla/5.0' \
+              "https://www.clarity.ms/tag/${want_clarity}" || true)
+            echo "clarity.ms/tag/${want_clarity} -> HTTP ${CCODE}"
+            if [ "$CCODE" != "200" ]; then
+              echo "::warning::Clarity 脚本入口未返回 200，请确认 project id 是否正确"
+            fi
+          fi
+          echo "统计接线正常。"
+

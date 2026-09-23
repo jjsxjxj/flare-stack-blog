@@ -2,6 +2,7 @@ import z from "zod";
 
 const clientEnvSchema = z.object({
   VITE_UMAMI_WEBSITE_ID: z.string().optional(),
+  VITE_CLARITY_PROJECT_ID: z.string().optional(),
   VITE_TURNSTILE_SITE_KEY: z.string().optional(),
 });
 
